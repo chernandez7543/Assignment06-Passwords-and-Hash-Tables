@@ -1,1 +1,344 @@
 
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+uint64_t demoHash(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h = (h ^ c) * 1099511628211ULL;
+    }
+    return h;
+}
+
+struct UserRecord {
+    std::string salt;
+    uint64_t passwordHash = 0;
+};
+
+enum class Strategy { 
+Chaining, 
+Linear, 
+Quadratic, 
+DoubleHashing 
+};
+enum class State { 
+Empty, 
+Occupied,
+ Deleted
+ };
+
+struct Entry {
+    std::string username;
+    UserRecord user;
+    State state = State::Empty;
+};
+
+class HashTable {
+private:
+    Strategy strategy;
+    // Chaining stores several entries in each bucket.
+    std::vector<std::vector<Entry>> buckets;
+    // Open addressing stores at most one entry per slot.
+    std::vector<Entry> slots;
+    std::size_t itemCount = 0;
+    std::size_t deletedCount = 0;
+    std::size_t rehashCount = 0;
+    std::size_t tableCapacity;
+
+    static bool isPrime(std::size_t n) {
+        if (n < 2) return false;
+        for (std::size_t d = 2; d <= n / d; ++d) {
+            if (n % d == 0) return false;
+        }
+        return true;
+    }
+
+    static std::size_t nextPrime(std::size_t n) {
+        if (n < 7) n = 7;
+        while (!isPrime(n)) ++n;
+        return n;
+    }
+
+    std::size_t homeIndex(const std::string& key) const {
+        return demoHash(key) % tableCapacity;
+    }
+
+    std::size_t probeIndex(const std::string& key, std::size_t attempt) const {
+        std::size_t home = homeIndex(key);
+        if (strategy == Strategy::Quadratic) {
+            return (home + attempt * attempt) % tableCapacity;
+        }
+        if (strategy == Strategy::DoubleHashing) {
+            // A prime capacity and a nonzero step smaller than it cover all slots.
+            // The prefix produces a second educational hash of the username.
+            std::size_t step = 1 + demoHash("step:" + key) % (tableCapacity - 1);
+            return (home + attempt * step) % tableCapacity;
+        }
+        return (home + attempt) % tableCapacity; // Linear probing.
+    }
+
+    // Called only after checking for duplicates and making enough room.
+    void place(const std::string& key, const UserRecord& user) {
+        Entry entry{key, user, State::Occupied};
+        if (strategy == Strategy::Chaining) {
+            buckets[homeIndex(key)].push_back(entry);
+            ++itemCount;
+            return;
+        }
+        for (std::size_t i = 0; i < tableCapacity; ++i) {
+            Entry& slot = slots[probeIndex(key, i)];
+            if (slot.state != State::Occupied) {
+                if (slot.state == State::Deleted) --deletedCount;
+                slot = entry;
+                ++itemCount;
+                return;
+            }
+        }
+        throw std::runtime_error("No reachable slot: table invariant broken");
+    }
+
+    void rehash(std::size_t requestedCapacity) {
+        // Save live entries; their positions depend on the capacity.
+        std::vector<Entry> entries;
+        if (strategy == Strategy::Chaining) {
+            for (const auto& bucket : buckets) {
+                for (const Entry& entry : bucket) entries.push_back(entry);
+            }
+        } else {
+            for (const Entry& entry : slots) {
+                if (entry.state == State::Occupied) entries.push_back(entry);
+            }
+        }
+        tableCapacity = nextPrime(requestedCapacity);
+        buckets.clear();
+        slots.clear();
+        if (strategy == Strategy::Chaining) buckets.resize(tableCapacity);
+        else slots.resize(tableCapacity);
+        itemCount = 0;
+        deletedCount = 0;
+        for (const Entry& entry : entries) place(entry.username, entry.user);
+        ++rehashCount;
+    }
+
+public:
+    explicit HashTable(Strategy selected, std::size_t initialCapacity = 7)
+        : strategy(selected), tableCapacity(nextPrime(initialCapacity)) {
+        if (strategy == Strategy::Chaining) buckets.resize(tableCapacity);
+        else slots.resize(tableCapacity);
+    }
+
+    std::size_t size() const { return itemCount; }
+    std::size_t capacity() const { return tableCapacity; }
+    std::size_t rehashes() const { return rehashCount; }
+
+    double loadFactor() const {
+        return static_cast<double>(itemCount) / tableCapacity;
+    }
+
+    // Returned pointers are for immediate use because changes to the container can cause 
+   // them to become invalid
+    const UserRecord* find(const std::string& key) const {
+        if (strategy == Strategy::Chaining) {
+            for (const Entry& entry : buckets[homeIndex(key)]) {
+                if (entry.username == key) return &entry.user;
+            }
+        } else {
+            for (std::size_t i = 0; i < tableCapacity; ++i) {
+                const Entry& entry = slots[probeIndex(key, i)];
+                if (entry.state == State::Empty) return nullptr;
+                // Deleted slots should not stop the search because other values may be stored 
+	// further along due to collisions
+                if (entry.state == State::Occupied && entry.username == key) {
+                    return &entry.user;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // Duplicate usernames are rejected instead of overwriting accounts.
+    bool insert(const std::string& key, const UserRecord& user) {
+        if (find(key) != nullptr) return false;
+        if (strategy == Strategy::Chaining) {
+            if (static_cast<double>(itemCount + 1) / tableCapacity > 0.75) {
+                rehash(tableCapacity * 2);
+            }
+        } else {
+            // keep the hash table less than half full and use a prime number for its size to ensure 
+	// quadratic probing can find an empty slot
+            if (static_cast<double>(itemCount + 1) / tableCapacity >= 0.5) {
+                rehash(tableCapacity * 2);
+            } else if (static_cast<double>(itemCount + deletedCount + 1)
+                       / tableCapacity >= 0.5) {
+                // Remove deleted entries without increasing the hash table size, as long as the
+	// remaining entries still fit
+                rehash(tableCapacity);
+            }
+        }
+        place(key, user);
+        return true;
+    }
+
+    bool remove(const std::string& key) {
+        if (strategy == Strategy::Chaining) {
+            auto& bucket = buckets[homeIndex(key)];
+            for (std::size_t i = 0; i < bucket.size(); ++i) {
+                if (bucket[i].username == key) {
+                    bucket.erase(bucket.begin() + i);
+                    --itemCount;
+                    return true;
+                }
+            }
+        } else {
+            for (std::size_t i = 0; i < tableCapacity; ++i) {
+                Entry& entry = slots[probeIndex(key, i)];
+                if (entry.state == State::Empty) return false;
+                if (entry.state == State::Occupied && entry.username == key) {
+                    // A tombstone marks a deleted slot so searches can continue, so other
+	// stored values can still be found
+                    entry = Entry{};
+                    entry.state = State::Deleted;
+                    --itemCount;
+                    ++deletedCount;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+};
+
+// The pepper is stored separately from user information. For this classroom example,
+// it is publicly available, but in a real system, it should be kept in a secure and private 
+// location.
+const std::string DEMO_PEPPER = "classroom-pepper";
+
+UserRecord makeUser(const std::string& salt, const std::string& password) {
+    return {salt, demoHash(salt + password + DEMO_PEPPER)};
+}
+
+bool login(const HashTable& table, const std::string& username,
+           const std::string& password) {
+    const UserRecord* user = table.find(username);
+    if (user == nullptr) return false;
+    return demoHash(user->salt + password + DEMO_PEPPER) == user->passwordHash;
+}
+
+// These checks will still run even when the program is compiled with -DNDEBUG
+void check(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error("Test failed: " + message);
+}
+
+void testStrategy(Strategy strategy, const std::string& name) {
+    HashTable table(strategy);
+    UserRecord user = makeUser("test-salt", "test-password");
+    check(table.size() == 0 && table.loadFactor() == 0.0, "empty table");
+    check(table.find("missing") == nullptr, "empty lookup");
+    check(!table.remove("missing"), "empty removal");
+
+    // Find three DIFFERENT keys that collide in the initial seven-slot table.
+    std::vector<std::string> keys;
+    for (int i = 0; keys.size() < 3; ++i) {
+        std::string key = "collision" + std::to_string(i);
+        if (demoHash(key) % 7 == 0) keys.push_back(key);
+    }
+    for (const std::string& key : keys) check(table.insert(key, user), "collision insert");
+    check(table.capacity() == 7, "collision test did not resize");
+    for (const std::string& key : keys) check(table.find(key) != nullptr, "collision lookup");
+    check(!table.insert(keys[1], user) && table.size() == 3, "duplicate rejected");
+    check(table.loadFactor() == 3.0 / 7.0, "load factor");
+    check(table.remove(keys[0]), "remove first colliding key");
+    check(table.find(keys[0]) == nullptr, "removed key absent");
+    check(table.find(keys[1]) != nullptr && table.find(keys[2]) != nullptr,
+          "lookup beyond removed collision");
+    check(!table.remove(keys[0]), "repeat removal");
+    check(!table.insert(keys[1], user), "duplicate after deletion");
+    check(table.insert(keys[0], user), "reinsert removed key");
+
+    std::size_t oldCapacity = table.capacity();
+    for (int i = 0; i < 100; ++i) {
+        check(table.insert("user" + std::to_string(i), user), "bulk insertion");
+    }
+    check(table.capacity() > oldCapacity && table.rehashes() > 0, "automatic growth");
+    check(table.size() == 103, "count after growth");
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "user" + std::to_string(i);
+        check(login(table, key, "test-password"), "login after rehash");
+        check(!login(table, key, "wrong"), "wrong password");
+    }
+    for (const std::string& key : keys) check(table.find(key) != nullptr, "collisions survive growth");
+    check(!login(table, "unknown", "test-password"), "unknown account");
+    for (int i = 0; i < 100; ++i) {
+        check(table.remove("user" + std::to_string(i)), "bulk removal");
+    }
+    for (const std::string& key : keys) check(table.remove(key), "remove collision keys");
+    check(table.size() == 0, "empty after removals");
+    check(table.insert("fresh", user) && login(table, "fresh", "test-password"),
+          "reuse after removals");
+    std::cout << "PASS: " << name << '\n';
+}
+
+void runTests() {
+    // Fixed test values also verify that the hash function uses the correct constants.
+    check(demoHash("") == 1469598103934665603ULL, "empty hash");
+    check(demoHash("a") == 4953267810257967366ULL, "single-character hash");
+    check(makeUser("salt-a", "same").passwordHash != makeUser("salt-b", "same").passwordHash,
+          "different salts for same password");
+    testStrategy(Strategy::Chaining, "separate chaining");
+    testStrategy(Strategy::Linear, "linear probing");
+    testStrategy(Strategy::Quadratic, "quadratic probing");
+    testStrategy(Strategy::DoubleHashing, "double hashing");
+    std::cout << "All tests passed.\n";
+}
+
+void runDemo() {
+    // Chose chaining because it makes handling collisions and deleting entries easier
+    HashTable users(Strategy::Chaining);
+    const std::string names[] = {"alice", "bob", "carol", "dave", "erin", "frank"};
+    const std::string passwords[] = {"apple17", "banana17", "cherry17", "date17", "mango17", "fig17"};
+    for (int i = 0; i < 5; ++i) {
+        // Using fixed, unique salts makes the results consistent for this example
+        users.insert(names[i], makeUser("demo-salt-" + std::to_string(i), passwords[i]));
+    }
+    std::cout << "Stored users: " << users.size() << '\n';
+    // Test each registered user with their correct password.
+for (int i = 0; i < 5; ++i) {
+    bool success = login(users, names[i], passwords[i]);
+
+    std::cout << names[i] << " login: "
+              << (success ? "SUCCESS" : "FAILED") << '\n';
+}
+    std::cout << "alice / apple17: " << (login(users, "alice", "apple17") ? "SUCCESS" : "FAILED") << '\n';
+    std::cout << "alice / wrong: " << (login(users, "alice", "wrong") ? "SUCCESS" : "FAILED") << '\n';
+    std::cout << "unknown / apple17: " << (login(users, "unknown", "apple17") ? "SUCCESS" : "FAILED") << '\n';
+
+    std::size_t before = users.capacity();
+    users.insert(names[5], makeUser("demo-salt-5", passwords[5]));
+    std::cout << "Rehash capacity: " << before << " -> " << users.capacity() << '\n';
+    std::cout << "alice after rehash: " << (login(users, "alice", "apple17") ? "SUCCESS" : "FAILED") << '\n';
+    std::cout << "Remove bob: " << (users.remove("bob") ? "REMOVED" : "NOT FOUND") << '\n';
+    std::cout << "bob after removal: " << (login(users, "bob", "banana17") ? "SUCCESS" : "FAILED") << '\n';
+    std::cout << "Remaining users: " << users.size() << '\n';
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        if (argc == 2 && std::string(argv[1]) == "--test") {
+            runTests();
+        } else if (argc == 1) {
+            runDemo();
+        } else {
+            std::cerr << "Usage: " << argv[0] << " [--test]\n";
+            return 1;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+
